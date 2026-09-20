@@ -7,8 +7,11 @@ GAME_OVER_TITLE = 'GAME OVER'
 GAME_OVER_HINT = 'PRESS ANY KEY TO RESTART'
 WIN_TITLE = 'YOU WIN!'
 EXPLOSION_FLASH_MS = 600
+COUNTDOWN_STEPS = 3
+COUNTDOWN_STEP_MS = 1000
+PAUSE_HINT = 'PRESS P OR CLICK TO RESUME'
 
-PLAYING,EXPLODING,GAME_OVER = 'playing','exploding','game_over'
+PLAYING,PAUSED,RESUMING,EXPLODING,GAME_OVER = 'playing','paused','resuming','exploding','game_over'
 
 class ASSET_ERROR(Exception):
 	pass
@@ -179,12 +182,13 @@ class BOMB(ITEM):
 		game.start_explosion()
 
 class ITEM_SPAWNER:
-	def __init__(self,grid_size,bomb_chance = 0.5,rng = random):
+	def __init__(self,grid_size,bomb_chance = 0.5,rng = random,blocked_cells = ()):
 		if not 0 <= bomb_chance <= 1:
 			raise ValueError(f'bomb_chance must be between 0 and 1, got {bomb_chance}')
 		self.grid_size = grid_size
 		self.bomb_chance = bomb_chance
 		self.rng = rng
+		self.blocked_cells = set(blocked_cells)
 
 		self.apple = APPLE(load_image('Graphics/apple.png'))
 		self.bomb = None
@@ -216,7 +220,7 @@ class ITEM_SPAWNER:
 		return True
 
 	def free_cells(self,snake):
-		occupied = {self.cell(block) for block in snake.body}
+		occupied = {self.cell(block) for block in snake.body} | self.blocked_cells
 		free_cells = [(x,y) for x in range(self.grid_size) for y in range(self.grid_size) if (x,y) not in occupied]
 		# keep items off the tile right in front of the snake's head, unless nothing else is left
 		ahead = self.cell(snake.cell_ahead())
@@ -226,12 +230,51 @@ class ITEM_SPAWNER:
 	def cell(position):
 		return (int(position.x),int(position.y))
 
+class BUTTON(ABC):
+	def __init__(self,rect,on_click,is_enabled = lambda: True):
+		self.rect = rect
+		self.on_click = on_click
+		self.is_enabled = is_enabled
+
+	def handle_event(self,event):
+		if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.is_enabled() and self.rect.collidepoint(event.pos):
+			self.on_click()
+			return True
+		return False
+
+	def draw(self):
+		hovered = self.is_enabled() and self.rect.collidepoint(pygame.mouse.get_pos())
+		pygame.draw.rect(screen,(187,229,81) if hovered else (167,209,61),self.rect)
+		icon = self.get_icon()
+		screen.blit(icon,icon.get_rect(center = self.rect.center))
+		pygame.draw.rect(screen,(56,74,12),self.rect,2)
+
+	@abstractmethod
+	def get_icon(self):
+		pass
+
+class PAUSE_BUTTON(BUTTON):
+	def __init__(self,game):
+		# sits on the top right tile of the grid, which is out of play (see MAIN.blocked_cells)
+		rect = pygame.Rect((cell_number - 1) * cell_size,0,cell_size,cell_size)
+		super().__init__(rect,game.toggle_pause,lambda: game.state in (PLAYING,PAUSED,RESUMING))
+		self.game = game
+		icon_size = (cell_size - 12,cell_size - 12)
+		self.pause_icon = pygame.transform.smoothscale(load_image('Graphics/pause.png'),icon_size)
+		self.play_icon = pygame.transform.smoothscale(load_image('Graphics/play.png'),icon_size)
+
+	def get_icon(self):
+		return self.play_icon if self.game.state == PAUSED else self.pause_icon
+
 class MAIN:
 	def __init__(self):
 		self.snake = SNAKE()
-		self.item_spawner = ITEM_SPAWNER(cell_number)
+		self.blocked_cells = {(cell_number - 1,0)} # under the pause button: no items, deadly for the snake
+		self.item_spawner = ITEM_SPAWNER(cell_number,blocked_cells = self.blocked_cells)
+		self.pause_button = PAUSE_BUTTON(self)
 		self.title_text = PIXEL_TEXT(32,16,4)
 		self.body_text = PIXEL_TEXT(16,16,2)
+		self.countdown_text = PIXEL_TEXT(96,16,10)
 		self.overlay = pygame.Surface(screen.get_size())
 		self.state = PLAYING
 		self.state_start = 0
@@ -254,12 +297,28 @@ class MAIN:
 			self.check_fail()
 
 	def update_state(self):
-		if self.state == EXPLODING and pygame.time.get_ticks() - self.state_start >= EXPLOSION_FLASH_MS:
+		elapsed = pygame.time.get_ticks() - self.state_start
+		if self.state == EXPLODING and elapsed >= EXPLOSION_FLASH_MS:
 			self.game_over()
+		elif self.state == RESUMING and elapsed >= COUNTDOWN_STEPS * COUNTDOWN_STEP_MS:
+			self.state = PLAYING
+
+	def toggle_pause(self):
+		# clicking again during the countdown pauses again; explosion and game over can't be paused
+		if self.state == PLAYING or self.state == RESUMING:
+			self.state = PAUSED
+		elif self.state == PAUSED:
+			self.state = RESUMING
+			self.state_start = pygame.time.get_ticks()
+
+	def handle_click(self,event):
+		self.pause_button.handle_event(event)
 
 	def handle_key(self,key):
 		if self.state == GAME_OVER:
 			self.start_new_round()
+		elif key == pygame.K_p:
+			self.toggle_pause()
 		elif self.state == PLAYING:
 			if key == pygame.K_UP:
 				if self.snake.direction.y != 1:
@@ -279,6 +338,11 @@ class MAIN:
 		self.item_spawner.draw_items()
 		self.snake.draw_snake()
 		self.draw_score()
+		if self.state == PAUSED:
+			self.draw_paused()
+		elif self.state == RESUMING:
+			self.draw_countdown()
+		self.pause_button.draw() # above the pause/countdown overlay so it stays clickable, below the flash/game over ones
 		if self.state == EXPLODING:
 			self.draw_explosion_flash()
 		elif self.state == GAME_OVER:
@@ -292,6 +356,10 @@ class MAIN:
 
 	def check_fail(self):
 		if not 0 <= self.snake.body[0].x < cell_number or not 0 <= self.snake.body[0].y < cell_number:
+			self.game_over()
+			return
+
+		if self.item_spawner.cell(self.snake.body[0]) in self.blocked_cells:
 			self.game_over()
 			return
 
@@ -309,16 +377,33 @@ class MAIN:
 		self.game_over_title = title
 		self.final_score = len(self.snake.body) - 3
 
-	def draw_explosion_flash(self):
-		progress = min(1,(pygame.time.get_ticks() - self.state_start) / EXPLOSION_FLASH_MS)
-		self.overlay.fill((220,20,20))
-		self.overlay.set_alpha(int(200 - 100 * progress))
+	def draw_overlay(self,color,alpha):
+		self.overlay.fill(color)
+		self.overlay.set_alpha(alpha)
 		screen.blit(self.overlay,(0,0))
 
+	def draw_explosion_flash(self):
+		progress = min(1,(pygame.time.get_ticks() - self.state_start) / EXPLOSION_FLASH_MS)
+		self.draw_overlay((220,20,20),int(200 - 100 * progress))
+
+	def draw_paused(self):
+		self.draw_overlay((0,0,0),140)
+		center_x = screen.get_width() // 2
+		center_y = screen.get_height() // 2
+		title_surface = self.title_text.render('PAUSED',(255,255,255))
+		screen.blit(title_surface,title_surface.get_rect(center = (center_x,center_y - 20)))
+		hint_surface = self.body_text.render(PAUSE_HINT,(255,220,80))
+		screen.blit(hint_surface,hint_surface.get_rect(center = (center_x,center_y + 40)))
+
+	def draw_countdown(self):
+		self.draw_overlay((0,0,0),140)
+		elapsed = pygame.time.get_ticks() - self.state_start
+		number = max(1,COUNTDOWN_STEPS - elapsed // COUNTDOWN_STEP_MS)
+		number_surface = self.countdown_text.render(str(number),(255,255,255))
+		screen.blit(number_surface,number_surface.get_rect(center = screen.get_rect().center))
+
 	def draw_game_over(self):
-		self.overlay.fill((60,0,0))
-		self.overlay.set_alpha(190)
-		screen.blit(self.overlay,(0,0))
+		self.draw_overlay((60,0,0),190)
 
 		center_x = screen.get_width() // 2
 		center_y = screen.get_height() // 2
@@ -361,36 +446,40 @@ class MAIN:
 		screen.blit(apple_sprite,apple_rect)
 		pygame.draw.rect(screen,(56,74,12),bg_rect,2)
 
-pygame.mixer.pre_init(44100,-16,2,512)
-pygame.init()
 cell_size = 40
 cell_number = 20
-screen = pygame.display.set_mode((cell_number * cell_size,cell_number * cell_size))
-clock = pygame.time.Clock()
 
-try:
-	game_font = load_font('Font/PoetsenOne-Regular.ttf',25)
-	main_game = MAIN()
-except ASSET_ERROR as error:
-	print(f'Error: {error}')
-	pygame.quit()
-	sys.exit(1)
+if __name__ == '__main__':
+	pygame.mixer.pre_init(44100,-16,2,512)
+	pygame.init()
+	screen = pygame.display.set_mode((cell_number * cell_size,cell_number * cell_size))
+	clock = pygame.time.Clock()
 
-SCREEN_UPDATE = pygame.USEREVENT
-pygame.time.set_timer(SCREEN_UPDATE,150)
+	try:
+		game_font = load_font('Font/PoetsenOne-Regular.ttf',25)
+		main_game = MAIN()
+	except ASSET_ERROR as error:
+		print(f'Error: {error}')
+		pygame.quit()
+		sys.exit(1)
 
-while True:
-	for event in pygame.event.get():
-		if event.type == pygame.QUIT:
-			pygame.quit()
-			sys.exit()
-		if event.type == SCREEN_UPDATE:
-			main_game.update()
-		if event.type == pygame.KEYDOWN:
-			main_game.handle_key(event.key)
+	SCREEN_UPDATE = pygame.USEREVENT
+	pygame.time.set_timer(SCREEN_UPDATE,150)
 
-	main_game.update_state()
-	screen.fill((175,215,70))
-	main_game.draw_elements()
-	pygame.display.update()
-	clock.tick(60)
+	while True:
+		for event in pygame.event.get():
+			if event.type == pygame.QUIT:
+				pygame.quit()
+				sys.exit()
+			if event.type == SCREEN_UPDATE:
+				main_game.update()
+			if event.type == pygame.KEYDOWN:
+				main_game.handle_key(event.key)
+			if event.type == pygame.MOUSEBUTTONDOWN:
+				main_game.handle_click(event)
+
+		main_game.update_state()
+		screen.fill((175,215,70))
+		main_game.draw_elements()
+		pygame.display.update()
+		clock.tick(60)
